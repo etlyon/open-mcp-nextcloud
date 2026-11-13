@@ -49,7 +49,8 @@ class HubTools(unittest.IsolatedAsyncioTestCase):
         self.saved = tools.TRANSPORT
         tools.TRANSPORT = FAKE.transport
         conn = Connection(conn_id="c-hub-1", app="nextcloud", server=f"https://{HOST}", remote_user="alice",
-                          client_id="t", resource="r", display={}, secret={"login_name": LOGIN_NAME, "app_password": PASTED})
+                          client_id="t", resource="r", display={}, secret={"login_name": LOGIN_NAME, "app_password": PASTED},
+                          scope="read write send")
         self.token = CURRENT.set(conn)
 
     def tearDown(self):
@@ -118,7 +119,9 @@ class HubTools(unittest.IsolatedAsyncioTestCase):
     async def test_refusals_and_no_local_files(self):
         for path in ("../etc/passwd", "a/../../b", "./x"):
             with self.subTest(path=path):
-                self.assertIn("may not contain", await tools.nextcloud_read(tools.ReadInput(path=path)))
+                refused = await tools.nextcloud_read(tools.ReadInput(path=path))
+                self.assertEqual(refused, "Error: ValueError: the call failed.")
+                self.assertNotIn(path, refused)
         # An absolute-looking path is a path on the person's own Nextcloud, never on this machine.
         missing = await tools.nextcloud_read(tools.ReadInput(path="/etc/passwd"))
         self.assertTrue(missing.startswith("Error 404"))
@@ -128,7 +131,8 @@ class HubTools(unittest.IsolatedAsyncioTestCase):
             with self.subTest(extra=extra), self.assertRaises(ValidationError):
                 tools.WriteInput(path="x.txt", content="a", **extra)
         FAKE.mode.add("xxe")
-        self.assertIn("document type", await tools.nextcloud_search(tools.SearchInput(query="x")))
+        xml_refused = await tools.nextcloud_search(tools.SearchInput(query="x"))
+        self.assertEqual(xml_refused, "Error: _DocumentType: the call failed.")
         self.assertEqual(FAKE.other_hosts(), set())
 
     def test_document_type_refused_in_any_encoding(self):
@@ -147,7 +151,8 @@ class HubTools(unittest.IsolatedAsyncioTestCase):
         CURRENT.reset(self.token)
         self.token = CURRENT.set(Connection(conn_id=conn_id, app="nextcloud", server=f"https://{HOST}", remote_user="alice",
                                             client_id="t", resource="r", display={},
-                                            secret={"login_name": LOGIN_NAME, "app_password": PASTED}))
+                                            secret={"login_name": LOGIN_NAME, "app_password": PASTED},
+                                            scope="read write send"))
 
     async def test_idempotency_keys_are_per_connection(self):
         """Two people using the same idempotency key never replay each other's writes."""
@@ -164,24 +169,31 @@ class HubTools(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FAKE.puts, 2)
 
     async def test_confirmations_are_per_connection(self):
-        """A confirmation one person was given never runs a call for another person."""
+        """A token the model can copy never deletes. The person's own form does, for that connection only."""
         args = {"params": {"path": "Projects/notes.txt"}}
 
-        async def delete(conn_id, **extra):
+        async def delete(conn_id, *, confirm=False, **extra):
             self.as_connection(conn_id)
-            async with Client(tools.mcp) as client:
-                return json.loads((await client.call_tool("nextcloud_delete", {**args, **extra},
-                                                          raise_on_error=False)).content[0].text)
+
+            async def accept(message, response_type, params, ctx):
+                return {"confirm": True}
+
+            async with Client(tools.mcp, elicitation_handler=accept if confirm else None) as client:
+                result = await client.call_tool("nextcloud_delete", {**args, **extra}, raise_on_error=False)
+            text = result.content[0].text
+            try:
+                return json.loads(text)
+            except ValueError:
+                return text
 
         asked = await delete("c-person-a")
-        self.assertEqual(asked["status"], "confirmation_required")
-        with self.assertRaises(Exception) as ctx:                         # another person: refused, nothing ran
-            self.as_connection("c-person-b")
-            async with Client(tools.mcp) as client:
-                await client.call_tool("nextcloud_delete", {**args, "confirm_token": asked["confirm_token"]})
-        self.assertIn("not issued for this account", str(ctx.exception))
+        asked_text = json.dumps(asked) if isinstance(asked, dict) else str(asked)
+        self.assertNotIn("confirm_token", asked_text)
+        self.assertIn("nothing ran", asked_text)
+        other = await delete("c-person-b", confirm_token="1." + "ab" * 32)
+        self.assertIn("confirm_token", json.dumps(other) if isinstance(other, dict) else str(other))
         self.assertIn("Projects/notes.txt", FAKE.files)
-        done = await delete("c-person-a", confirm_token=asked["confirm_token"])   # its own person: it runs
+        done = await delete("c-person-a", confirm=True)
         self.assertTrue(done["deleted_to_trash"])
         self.assertNotIn("Projects/notes.txt", FAKE.files)
 

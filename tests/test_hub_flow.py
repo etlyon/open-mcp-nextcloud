@@ -93,7 +93,7 @@ class HubFlow(unittest.TestCase):
         verifier, challenge = pkce()
         r = self.client.get("/authorize", params={"response_type": "code", "client_id": client_id, "redirect_uri": redirect,
                                                   "code_challenge": challenge, "code_challenge_method": "S256",
-                                                  "state": "st-1", "resource": resource})
+                                                  "state": "st-1", "resource": resource, "scope": "read write send"})
         self.assertEqual(r.status_code, 302, r.text)
         return verifier, r.headers["location"]
 

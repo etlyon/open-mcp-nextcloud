@@ -46,6 +46,9 @@ from open_connectors import identity, net
 from open_connectors.apps.nextcloud import probe
 from open_connectors.journal import run_keyed
 from open_connectors.policy import AccountToolPolicy
+from open_connectors.throttle import Throttle
+
+THROTTLE = Throttle()
 
 LOGGER = logging.getLogger("open_connectors.apps.nextcloud")
 
@@ -170,6 +173,8 @@ def _client(timeout: float) -> httpx.AsyncClient:
 async def _request(method: str, url: str, *, timeout: float = 30.0, headers: dict[str, str] | None = None,
                    content: bytes | None = None, max_bytes: int = MAX_LISTING_BYTES) -> bytes:
     """One request to the connection's own server; raises httpx.HTTPStatusError on any non-2xx answer."""
+    if THROTTLE.take(_connection().conn_id):
+        raise TooManyRequests("too many requests from this connection; nothing was sent.")
     async with _client(timeout) as client:
         async with client.stream(method, url, headers=headers, content=content) as response:
             body = await net.read_capped(response, max_bytes)
@@ -243,6 +248,10 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
+class TooManyRequests(Exception):
+    """This connection used its share of requests for this minute. The message is fixed words."""
+
+
 def _handle_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         if exc.response.status_code == 401:
@@ -250,7 +259,10 @@ def _handle_error(exc: Exception) -> str:
         return f"Error {exc.response.status_code}: Nextcloud rejected the request."
     if isinstance(exc, net.AddressError):
         return f"Error: AddressError: this connection's server cannot be reached safely ({exc.code})."
-    return f"Error: {type(exc).__name__}: {exc}"
+    if isinstance(exc, TooManyRequests):
+        return "Error: TooManyRequests: too many requests from this connection; nothing was sent."
+    # Exception text is never returned: parser and library messages can contain upstream data.
+    return f"Error: {type(exc).__name__}: the call failed."
 
 
 class _DocumentType(ValueError):
@@ -378,112 +390,48 @@ def _normalize_text(text: str) -> str:
 
 
 def _extract_pdf(data: bytes) -> tuple[str, dict[str, Any], list[str]]:
-    from pypdf import PdfReader
+    from open_connectors.pdf_text import PdfTextError, extract_pdf_text
 
-    reader = PdfReader(BytesIO(data))
-    if reader.is_encrypted:
-        try:
-            reader.decrypt("")
-        except Exception as exc:
-            raise ValueError("The PDF is encrypted and cannot be read without a password.") from exc
-    total_pages = len(reader.pages)
-    page_limit = min(total_pages, MAX_PDF_PAGES)
-    parts: list[str] = []
-    warnings: list[str] = []
-    for index in range(page_limit):
-        try:
-            page_text = reader.pages[index].extract_text() or ""
-        except Exception:
-            warnings.append(f"Page {index + 1} could not be extracted.")
-            continue
-        if page_text.strip():
-            parts.append(f"[Page {index + 1}]\n{page_text}")
-    if total_pages > page_limit:
-        warnings.append(f"Only the first {page_limit} of {total_pages} pages were processed.")
-    if not parts:
-        warnings.append("No embedded text was found; this document may require OCR.")
-    return "\n\n".join(parts), {"pages_total": total_pages, "pages_processed": page_limit}, warnings
+    try:
+        return extract_pdf_text(data)
+    except PdfTextError as exc:
+        raise ValueError(str(exc)) from None
 
 
-def _extract_docx(data: bytes) -> tuple[str, dict[str, Any], list[str]]:
-    from docx import Document
+def _extract_docx(data: bytes, max_chars: int) -> tuple[str, dict[str, Any], list[str]]:
+    from open_connectors.pdf_text import OfficeTextError, extract_office_text
 
-    _validate_office_package(data)
-    document = Document(BytesIO(data))
-    parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
-    table_rows = 0
-    for table in document.tables:
-        for row in table.rows:
-            values = [cell.text.strip() for cell in row.cells]
-            if any(values):
-                parts.append("\t".join(values))
-                table_rows += 1
-    return "\n".join(parts), {"paragraphs": len(document.paragraphs), "table_rows": table_rows}, []
+    try:
+        return extract_office_text(data, "docx", max_chars)
+    except OfficeTextError as exc:
+        raise ValueError(str(exc)) from None
 
 
 def _extract_xlsx(data: bytes, max_chars: int) -> tuple[str, dict[str, Any], list[str]]:
-    from openpyxl import load_workbook
+    from open_connectors.pdf_text import OfficeTextError, extract_office_text
 
-    _validate_office_package(data)
-    workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
-    sheet_count = len(workbook.sheetnames)
-    parts: list[str] = []
-    cells_read = 0
-    truncated = False
     try:
-        for worksheet in workbook.worksheets:
-            parts.append(f"[Sheet: {worksheet.title}]")
-            for row in worksheet.iter_rows(values_only=True):
-                values = ["" if value is None else str(value) for value in row]
-                while values and values[-1] == "":
-                    values.pop()
-                if not values:
-                    continue
-                parts.append("\t".join(values))
-                cells_read += len(values)
-                if sum(len(part) + 1 for part in parts) > max_chars * 2:
-                    truncated = True
-                    break
-            if truncated:
-                break
-    finally:
-        workbook.close()
-    warnings = ["Spreadsheet processing stopped after reaching the extraction limit."] if truncated else []
-    return "\n".join(parts), {"sheets": sheet_count, "cells_read": cells_read, "extraction_truncated": truncated}, warnings
+        return extract_office_text(data, "xlsx", max_chars)
+    except OfficeTextError as exc:
+        raise ValueError(str(exc)) from None
 
 
-def _extract_pptx(data: bytes) -> tuple[str, dict[str, Any], list[str]]:
-    from pptx import Presentation
+def _extract_pptx(data: bytes, max_chars: int) -> tuple[str, dict[str, Any], list[str]]:
+    from open_connectors.pdf_text import OfficeTextError, extract_office_text
 
-    _validate_office_package(data)
-    presentation = Presentation(BytesIO(data))
-    parts: list[str] = []
-    for index, slide in enumerate(presentation.slides, start=1):
-        slide_parts: list[str] = []
-        for shape in slide.shapes:
-            text = getattr(shape, "text", "")
-            if text and text.strip():
-                slide_parts.append(text.strip())
-        if slide_parts:
-            parts.append(f"[Slide {index}]\n" + "\n".join(slide_parts))
-    return "\n\n".join(parts), {"slides": len(presentation.slides)}, []
+    try:
+        return extract_office_text(data, "pptx", max_chars)
+    except OfficeTextError as exc:
+        raise ValueError(str(exc)) from None
 
 
-def _extract_odf(data: bytes) -> tuple[str, dict[str, Any], list[str]]:
-    _validate_office_package(data)
-    with ZipFile(BytesIO(data)) as archive:
-        try:
-            content = archive.read("content.xml")
-        except KeyError as exc:
-            raise ValueError("The OpenDocument package does not contain content.xml.") from exc
-    root = _xml(content)
-    paragraphs: list[str] = []
-    for element in root.iter():
-        if element.tag.endswith("}p") or element.tag.endswith("}h"):
-            text = "".join(element.itertext()).strip()
-            if text:
-                paragraphs.append(text)
-    return "\n".join(paragraphs), {"paragraphs": len(paragraphs)}, []
+def _extract_odf(data: bytes, max_chars: int) -> tuple[str, dict[str, Any], list[str]]:
+    from open_connectors.pdf_text import OfficeTextError, extract_office_text
+
+    try:
+        return extract_office_text(data, "odf", max_chars)
+    except OfficeTextError as exc:
+        raise ValueError(str(exc)) from None
 
 
 TEXT_EXTENSIONS = {
@@ -509,16 +457,16 @@ def _extract_document(data: bytes, path: str, content_type: str | None, max_char
         text, stats, warnings = _extract_pdf(data)
         document_format = "pdf"
     elif extension in {".docx", ".dotx", ".docm"} or "wordprocessingml" in media_type:
-        text, stats, warnings = _extract_docx(data)
+        text, stats, warnings = _extract_docx(data, start_char + max_chars)
         document_format = "docx"
     elif extension in {".xlsx", ".xlsm", ".xltx"} or "spreadsheetml" in media_type:
         text, stats, warnings = _extract_xlsx(data, start_char + max_chars)
         document_format = "xlsx"
     elif extension in {".pptx", ".potx", ".ppsx"} or "presentationml" in media_type:
-        text, stats, warnings = _extract_pptx(data)
+        text, stats, warnings = _extract_pptx(data, start_char + max_chars)
         document_format = "pptx"
     elif extension in {".odt", ".ods", ".odp", ".ott", ".ots", ".otp"} or "opendocument" in media_type:
-        text, stats, warnings = _extract_odf(data)
+        text, stats, warnings = _extract_odf(data, start_char + max_chars)
         document_format = "opendocument"
     else:
         raise ValueError(
