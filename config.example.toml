@@ -1,7 +1,7 @@
 # open-mcp-nextcloud — one process, one public host. Nothing here is secret.
 public_url = "https://hub.example.org"
 app = "nextcloud"
-state_dir = "/var/lib/open-mcp-nextcloud"
+state_dir = "/data"
 source_url = "https://github.com/etlyon/open-mcp-nextcloud"
 maker_label = "open source"
 other_assistants = true
